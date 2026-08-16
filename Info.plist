@@ -6,6 +6,8 @@
     <string>ToDoApp</string>
     <key>CFBundleIdentifier</key>
     <string>local.trenthall.todoapp</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleName</key>
     <string>To-Do</string>
     <key>CFBundleDisplayName</key>

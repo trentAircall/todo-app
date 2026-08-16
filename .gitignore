@@ -1,3 +1,16 @@
+# Build output
 .build/
 *.dSYM
+ToDo.app/
+mcp-server/node_modules/
+mcp-server/server.log*
+
+# Your actual task data. These are real meeting names, attendees, and
+# conference links — they live on disk next to the app, not in the repo.
+# (Removing this line will start tracking them again; see README.)
+Tasks/
+
+# Per-machine Claude Code permissions, not project config
+.claude/settings.local.json
+
 .DS_Store

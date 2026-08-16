@@ -1,0 +1,20 @@
+{
+  "name": "todo-app-mcp",
+  "version": "1.1.0",
+  "description": "Local MCP server over the To-Do app's Tasks/ folder — add, complete, reschedule, search, and chain follow-up tasks in the same .md files the Swift app reads.",
+  "main": "index.js",
+  "type": "commonjs",
+  "private": true,
+  "license": "ISC",
+  "author": "Trent Hall",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  }
+}

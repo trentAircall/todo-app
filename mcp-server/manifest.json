@@ -1,0 +1,17 @@
+{
+  "manifest_version": "0.3",
+  "name": "todo-app-mcp",
+  "version": "1.0.0",
+  "description": "Read/write access to the local To-Do run-sheet app's Tasks folder — add, complete, reschedule, search, and chain follow-up tasks.",
+  "author": {
+    "name": "Trent Hall"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/index.js"]
+    }
+  }
+}

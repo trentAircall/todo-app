@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AppKit
+import ToDoCore
 
 /// Loads, watches, and mutates the `.md` task files in the `Tasks` folder
 /// that sits next to this app (or, when run via `swift run` during
@@ -11,20 +12,52 @@ import AppKit
 final class TaskStore: ObservableObject {
     @Published private(set) var tasks: [TaskItem] = []
 
+    /// Set whenever a write fails. Every mutation used to swallow its error
+    /// with `try?`, so a failed save looked exactly like a successful one —
+    /// the sheet closed, the list reloaded, and the edit was simply gone.
+    /// ContentView presents this as an alert.
+    @Published var lastError: StoreError?
+
+    struct StoreError: Identifiable {
+        let id = UUID()
+        let message: String
+        let detail: String
+    }
+
     let tasksFolder: URL
 
-    private var pollTimer: Timer?
+    /// Backstop poll interval. The directory watcher below catches file
+    /// creation, deletion, and atomic rename-into-place (which is how both
+    /// this app and the MCP server write), so this only needs to cover
+    /// in-place edits by an external text editor — a rarer case that can
+    /// tolerate a couple of seconds.
+    private static let pollInterval: TimeInterval = 2.0
+
+    /// Holds the two long-lived observers so they can be torn down without a
+    /// `deinit` on this class. A `deinit` is always non-isolated, so reaching
+    /// into `@MainActor` stored properties from one is a warning today and an
+    /// error under the Swift 6 language mode. Letting an ordinary,
+    /// non-isolated object own them sidesteps that: when the store goes away
+    /// this box goes with it and cleans up in its own `deinit`.
+    private final class Watchers {
+        var timer: Timer?
+        var source: DispatchSourceFileSystemObject?
+
+        deinit {
+            timer?.invalidate()
+            source?.cancel()
+        }
+    }
+
+    private let watchers = Watchers()
     private var lastSignature: String = ""
 
     init() {
         tasksFolder = TaskStore.resolveTasksFolder()
         try? FileManager.default.createDirectory(at: tasksFolder, withIntermediateDirectories: true)
         reload()
+        startWatching()
         startPolling()
-    }
-
-    deinit {
-        pollTimer?.invalidate()
     }
 
     /// The `Tasks` folder lives next to the running `.app` bundle so the
@@ -41,60 +74,93 @@ final class TaskStore: ObservableObject {
         return containingDir.appendingPathComponent("Tasks", isDirectory: true)
     }
 
-    private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+    // MARK: - Change detection
+
+    /// A kernel-level watch on the directory: an external write shows up
+    /// essentially instantly instead of on the next poll tick, and costs
+    /// nothing while the folder is idle. Previously this was a 1-second
+    /// timer that stat'd every file in the folder, forever.
+    private func startWatching() {
+        let descriptor = open(tasksFolder.path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .rename, .delete],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
             Task { @MainActor in
                 self?.reloadIfChanged()
             }
         }
+        source.setCancelHandler { close(descriptor) }
+        source.resume()
+        watchers.source = source
+    }
+
+    private func startPolling() {
+        let timer = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.reloadIfChanged()
+            }
+        }
+        // `.common` rather than the default mode: a timer registered in
+        // `.default` alone stops firing while a menu is open or a scroll is
+        // tracking — precisely when the menu bar glance is on screen.
+        RunLoop.main.add(timer, forMode: .common)
+        watchers.timer = timer
     }
 
     /// Cheap change detection so an external edit (Claude writing a file)
-    /// shows up within ~1s without rebuilding the list — and thus resetting
-    /// any in-progress UI state — on every single tick.
-    private func directorySignature() -> String {
-        let fm = FileManager.default
-        guard let urls = try? fm.contentsOfDirectory(
-            at: tasksFolder,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return "empty"
-        }
-        let mdFiles = urls.filter { $0.pathExtension.lowercased() == "md" }
+    /// shows up without rebuilding the list — and thus resetting any
+    /// in-progress UI state — on every single tick.
+    private func directorySignature(from urls: [URL]) -> String {
         var latest: TimeInterval = 0
-        for url in mdFiles {
+        for url in urls {
             if let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
                 latest = max(latest, date.timeIntervalSince1970)
             }
         }
-        return "\(mdFiles.count)-\(latest)"
+        return "\(urls.count)-\(latest)"
     }
 
-    func reloadIfChanged() {
-        let signature = directorySignature()
-        guard signature != lastSignature else { return }
-        lastSignature = signature
-        reload()
-    }
-
-    func reload() {
+    private func taskFileURLs() -> [URL] {
         let fm = FileManager.default
         guard let urls = try? fm.contentsOfDirectory(
             at: tasksFolder,
             includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) else {
-            tasks = []
-            return
+            return []
         }
+        return urls.filter { $0.pathExtension.lowercased() == "md" }
+    }
 
-        let loaded: [TaskItem] = urls
-            .filter { $0.pathExtension.lowercased() == "md" }
-            .compactMap { url in
-                guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
-                return TaskFile.parse(url: url, contents: contents)
-            }
+    func reloadIfChanged() {
+        let urls = taskFileURLs()
+        let signature = directorySignature(from: urls)
+        guard signature != lastSignature else { return }
+        load(urls: urls, signature: signature)
+    }
+
+    func reload() {
+        let urls = taskFileURLs()
+        load(urls: urls, signature: directorySignature(from: urls))
+    }
+
+    /// The signature is computed from the *same* directory listing the tasks
+    /// are read from and recorded up front. Recomputing it afterwards (as
+    /// this used to) folds any write that landed mid-read into the accepted
+    /// state, so that change would never be picked up.
+    private func load(urls: [URL], signature: String) {
+        lastSignature = signature
+
+        let loaded: [TaskItem] = urls.compactMap { url in
+            guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+            let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            return TaskFile.parse(url: url, contents: contents, modifiedAt: modifiedAt)
+        }
 
         tasks = loaded.sorted { a, b in
             if a.isDone != b.isDone {
@@ -102,8 +168,9 @@ final class TaskStore: ObservableObject {
             }
             return a.createdAt < b.createdAt
         }
-        lastSignature = directorySignature()
     }
+
+    // MARK: - Mutation
 
     /// Quick-capture: an unscheduled task for the given day, title only.
     func addTask(title: String, dateString: String) {
@@ -148,7 +215,11 @@ final class TaskStore: ObservableObject {
             body: body,
             createdAt: now
         )
-        try? contents.write(to: url, atomically: true, encoding: .utf8)
+        do {
+            try write(contents, to: url, expectedModifiedAt: nil)
+        } catch {
+            report(error, action: "create “\(trimmed)”")
+        }
         reload()
     }
 
@@ -177,21 +248,32 @@ final class TaskStore: ObservableObject {
             link: link,
             body: body
         )
-        writeAtomically(contents, to: task.url)
+        do {
+            try write(contents, to: task.url, expectedModifiedAt: task.modifiedAt)
+        } catch {
+            report(error, action: "save “\(task.title)”")
+        }
         reload()
     }
 
     func toggleDone(_ task: TaskItem) {
-        let newValue = !task.isDone
-        let newContents = TaskFile.serialize(task, isDone: newValue)
-        writeAtomically(newContents, to: task.url)
+        let newContents = TaskFile.serialize(task, isDone: !task.isDone)
+        do {
+            try write(newContents, to: task.url, expectedModifiedAt: task.modifiedAt)
+        } catch {
+            report(error, action: "update “\(task.title)”")
+        }
         reload()
     }
 
     func deleteTask(_ task: TaskItem) {
         // Move to Trash rather than permanently deleting — Finder-native
         // and reversible, matching the "it's just files" design.
-        try? FileManager.default.trashItem(at: task.url, resultingItemURL: nil)
+        do {
+            try FileManager.default.trashItem(at: task.url, resultingItemURL: nil)
+        } catch {
+            report(error, action: "delete “\(task.title)”")
+        }
         reload()
     }
 
@@ -202,6 +284,27 @@ final class TaskStore: ObservableObject {
     /// All tags currently in use, for display convenience.
     var allTags: [String] {
         Array(Set(tasks.flatMap(\.tags))).sorted()
+    }
+
+    // MARK: - Writing
+
+    enum WriteError: LocalizedError {
+        /// The file changed underneath us between being read and being
+        /// written. Both this app and the MCP server rewrite the whole file
+        /// from a snapshot, so without this check whichever one saves second
+        /// silently erases the other's work.
+        case staleSnapshot
+        case underlying(Error)
+
+        var errorDescription: String? {
+            switch self {
+            case .staleSnapshot:
+                return "This item was changed by something else (Claude, or a text editor) after the app read it. "
+                    + "Your change was not saved, so nothing was overwritten — reopen the item and redo the edit."
+            case .underlying(let error):
+                return error.localizedDescription
+            }
+        }
     }
 
     /// Resolves filename collisions (e.g. several files created within the
@@ -221,16 +324,43 @@ final class TaskStore: ObservableObject {
     }
 
     /// Writes to a temp file in the same directory, then swaps it into
-    /// place, so the polling reload never observes a half-written file.
-    private func writeAtomically(_ contents: String, to url: URL) {
+    /// place, so a reload never observes a half-written file.
+    ///
+    /// `expectedModifiedAt` is the optimistic-concurrency check — pass the
+    /// mtime the task was read at, or nil for a brand-new file.
+    private func write(_ contents: String, to url: URL, expectedModifiedAt: Date?) throws {
         let fm = FileManager.default
+
+        if let expectedModifiedAt {
+            let current = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            guard let current else { throw WriteError.staleSnapshot } // deleted out from under us
+            // Filesystem timestamp resolution varies; a second of slack
+            // avoids false alarms without weakening the check meaningfully.
+            if abs(current.timeIntervalSince(expectedModifiedAt)) > 1.0 {
+                throw WriteError.staleSnapshot
+            }
+        }
+
         let tempURL = url.deletingLastPathComponent()
             .appendingPathComponent(".\(UUID().uuidString).tmp")
         do {
             try contents.write(to: tempURL, atomically: false, encoding: .utf8)
-            _ = try fm.replaceItemAt(url, withItemAt: tempURL)
+            if fm.fileExists(atPath: url.path) {
+                _ = try fm.replaceItemAt(url, withItemAt: tempURL)
+            } else {
+                // replaceItemAt requires an existing destination — without
+                // this branch, saving an item whose file had been removed
+                // threw and (previously) failed silently.
+                try fm.moveItem(at: tempURL, to: url)
+            }
         } catch {
             try? fm.removeItem(at: tempURL)
+            throw WriteError.underlying(error)
         }
+    }
+
+    private func report(_ error: Error, action: String) {
+        let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        lastError = StoreError(message: "Couldn't \(action).", detail: detail)
     }
 }

@@ -1,0 +1,200 @@
+{
+  "_comment": [
+    "THE SHARED CONFORMANCE FIXTURES.",
+    "",
+    "The task file format is implemented twice — Sources/ToDoCore/TaskItem.swift",
+    "and mcp-server/taskfile.js — because the Swift app and the MCP server both",
+    "read and write the same folder. Two independent implementations of one",
+    "format WILL drift; this file is what catches it.",
+    "",
+    "Both Tests/ToDoCoreTests/ParserConformanceTests.swift and",
+    "mcp-server/test/conformance.test.js assert against these exact cases.",
+    "Change parsing behaviour in either language and you must add or update a",
+    "case here — then run BOTH suites:",
+    "",
+    "    swift test",
+    "    cd mcp-server && npm test",
+    "",
+    "Every case below that is marked with a `regression` note is a real bug",
+    "that shipped, not a hypothetical."
+  ],
+
+  "times": [
+    { "input": "00:00", "expected": 0 },
+    { "input": "9:00", "expected": 540 },
+    { "input": "09:00", "expected": 540 },
+    { "input": "15:00", "expected": 900 },
+    { "input": "23:59", "expected": 1439 },
+    { "input": "7:05", "expected": 425 },
+
+    { "input": "3pm", "expected": 900,
+      "regression": "Swift's DateFormatter path returned nil, so a hand-typed '3pm' showed as a scheduled 3pm item to the MCP server and as an unscheduled to-do in the app." },
+    { "input": "3 pm", "expected": 900 },
+    { "input": "3PM", "expected": 900 },
+    { "input": "3:30 pm", "expected": 930 },
+    { "input": "3:30pm", "expected": 930 },
+    { "input": "3:30 p.m.", "expected": 930 },
+    { "input": "12am", "expected": 0 },
+    { "input": "12:30 am", "expected": 30 },
+    { "input": "12pm", "expected": 720 },
+    { "input": "12:30 pm", "expected": 750 },
+    { "input": "1am", "expected": 60 },
+    { "input": "  9:15  ", "expected": 555, "note": "surrounding whitespace is trimmed" },
+
+    { "input": "", "expected": null },
+    { "input": "   ", "expected": null },
+    { "input": "noon", "expected": null },
+    { "input": "24:00", "expected": null },
+    { "input": "23:60", "expected": null },
+    { "input": "9:5", "expected": null, "note": "minutes must be exactly two digits" },
+    { "input": "9:005", "expected": null,
+      "regression": "Swift used Int(parts[1].prefix(2)) and read this as 9:00; JS rejected it." },
+    { "input": "0am", "expected": null, "note": "12-hour clock has no hour 0" },
+    { "input": "13pm", "expected": null, "note": "12-hour clock has no hour 13" },
+    { "input": "3:60pm", "expected": null },
+    { "input": "pm", "expected": null },
+    { "input": "3:00:00", "expected": null }
+  ],
+
+  "dates": [
+    { "input": "2026-08-16", "expected": true },
+    { "input": "2024-02-29", "expected": true, "note": "leap year" },
+    { "input": "2026-02-31", "expected": false,
+      "regression": "JS only checked the yyyy-MM-dd shape, so this passed there and rolled into March; Swift's non-lenient DateFormatter rejected it." },
+    { "input": "2026-02-29", "expected": false, "note": "2026 is not a leap year" },
+    { "input": "2026-13-01", "expected": false },
+    { "input": "2026-00-10", "expected": false },
+    { "input": "2026-08-00", "expected": false },
+    { "input": "2026-8-16", "expected": false, "note": "must be zero-padded" },
+    { "input": "tomorrow", "expected": false },
+    { "input": "", "expected": false }
+  ],
+
+  "slugs": [
+    { "input": "Crimsafe x Aircall Catchup", "expected": "crimsafe-x-aircall-catchup" },
+    { "input": "Trent / Judith AI phone setup", "expected": "trent-judith-ai-phone-setup" },
+    { "input": "  leading and trailing  ", "expected": "leading-and-trailing" },
+    { "input": "!!!", "expected": "task", "note": "empty slug falls back to 'task'" },
+    { "input": "", "expected": "task" },
+    { "input": "Ünïcödé café 日本", "expected": "n-c-d-caf",
+      "regression": "Swift used Character.isLetter, which accepts non-ASCII letters, so the two sides generated different filenames for the same title. Both are now ASCII-only." },
+    { "input": "a----b", "expected": "a-b", "note": "runs of separators collapse" },
+    { "input": "This title is definitely much longer than the forty character cap", "expected": "this-title-is-definitely-much-longer-tha", "note": "hard cap at 40 characters, mid-word if need be" }
+  ],
+
+  "files": [
+    {
+      "name": "full-meeting",
+      "note": "The everyday shape: every known key present.",
+      "file": "full-meeting.md",
+      "expected": {
+        "title": "Crimsafe x Aircall x BAC Catchup",
+        "kind": "meeting",
+        "done": false,
+        "dateString": "2026-08-10",
+        "startMinutes": 600,
+        "endMinutes": 660,
+        "tags": ["external", "crimsafe"],
+        "link": "https://meet.google.com/iey-npcb-uct",
+        "hasFrontmatter": true,
+        "body": "\nItems to discuss:\n- Automatic contact creation\n- Phone number formatting\n"
+      }
+    },
+    {
+      "name": "minimal-task",
+      "note": "An unscheduled to-do — no kind, no times, no link, no body.",
+      "file": "minimal-task.md",
+      "expected": {
+        "title": "Send the handover doc",
+        "kind": "task",
+        "done": false,
+        "dateString": "2026-08-16",
+        "startMinutes": null,
+        "endMinutes": null,
+        "tags": [],
+        "link": null,
+        "hasFrontmatter": true,
+        "body": ""
+      }
+    },
+    {
+      "name": "unknown-keys-preserved",
+      "note": "Comments, blank lines, and keys neither side knows must survive a round-trip byte-for-byte. `source` is written by the MCP server and is deliberately unknown to Swift.",
+      "file": "unknown-keys.md",
+      "expected": {
+        "title": "Task with extra frontmatter",
+        "kind": "task",
+        "done": true,
+        "dateString": "2026-08-12",
+        "startMinutes": 555,
+        "endMinutes": null,
+        "tags": ["internal"],
+        "link": null,
+        "hasFrontmatter": true,
+        "body": "\nNotes here.\n"
+      }
+    },
+    {
+      "name": "no-frontmatter",
+      "note": "A plain markdown file dropped into Tasks/. Must degrade to a filename-titled task, never be skipped or destroyed.",
+      "file": "no-frontmatter.md",
+      "expected": {
+        "title": "no frontmatter",
+        "kind": "task",
+        "done": false,
+        "startMinutes": null,
+        "endMinutes": null,
+        "tags": [],
+        "link": null,
+        "hasFrontmatter": false
+      }
+    },
+    {
+      "name": "bad-values",
+      "note": "Every value that can be wrong, is. Nothing here may throw; each bad field independently falls back. Its `created` is midday UTC on purpose: the invalid date falls back to the creation day in LOCAL time, and midday keeps that the same calendar day everywhere from UTC-12 to UTC+11.",
+      "file": "bad-values.md",
+      "expected": {
+        "title": "Task with unparseable fields",
+        "kind": "task",
+        "done": false,
+        "dateString": "2026-08-14",
+        "startMinutes": null,
+        "endMinutes": null,
+        "tags": ["ok"],
+        "hasFrontmatter": true
+      }
+    },
+    {
+      "name": "colon-in-values",
+      "note": "Only the FIRST colon separates key from value — titles and links routinely contain more.",
+      "file": "colon-in-values.md",
+      "expected": {
+        "title": "Q3 planning: scope and owners",
+        "kind": "meeting",
+        "done": false,
+        "dateString": "2026-08-18",
+        "startMinutes": 810,
+        "endMinutes": 870,
+        "tags": [],
+        "link": "https://example.com:8443/room?id=1",
+        "hasFrontmatter": true
+      }
+    },
+    {
+      "name": "crlf-line-endings",
+      "note": "A file saved by a Windows-ish editor still has to parse.",
+      "file": "crlf.md",
+      "expected": {
+        "title": "CRLF task",
+        "kind": "task",
+        "done": false,
+        "dateString": "2026-08-19",
+        "startMinutes": 480,
+        "endMinutes": null,
+        "tags": ["ops"],
+        "hasFrontmatter": true,
+        "body": "\nBody line one.\n"
+      }
+    }
+  ]
+}

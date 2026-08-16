@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 
 /// Renders a task's description body as markdown so `[label](url)` links —
 /// and bare `https://…` URLs, which get auto-wrapped first — are clickable.
@@ -13,13 +14,45 @@ struct MarkdownText: View {
     }
 
     static func attributed(for text: String) -> AttributedString {
-        let linked = autolinkPlainURLs(text)
+        let prepared = autolinkPlainURLs(demoteBlockSyntax(text))
         var options = AttributedString.MarkdownParsingOptions()
+        // `.inlineOnlyPreservingWhitespace` keeps the author's line breaks,
+        // which matters for notes. The trade-off is that block constructs
+        // are NOT interpreted — hence `demoteBlockSyntax` below. Switching
+        // to `.full` is not the fix: it emits block presentation intents
+        // that `Text` ignores, so headings and bullets would lose their
+        // line structure entirely instead of just their styling.
         options.interpretedSyntax = .inlineOnlyPreservingWhitespace
-        if let attributed = try? AttributedString(markdown: linked, options: options) {
+        if let attributed = try? AttributedString(markdown: prepared, options: options) {
             return attributed
         }
         return AttributedString(text)
+    }
+
+    /// Rewrites the block-level markdown we actually generate into inline
+    /// equivalents, so it stops rendering as literal `##` and `*` noise.
+    ///
+    /// The MCP server's `log_enrichment` writes an `## Enrichment log`
+    /// heading followed by `- ` bullets; hand-written prep notes use the
+    /// same shapes. Headings become bold text, and list markers become a
+    /// real bullet character.
+    static func demoteBlockSyntax(_ text: String) -> String {
+        text
+            .components(separatedBy: "\n")
+            .map { line -> String in
+                let indent = line.prefix { $0 == " " || $0 == "\t" }
+                let content = line[line.index(line.startIndex, offsetBy: indent.count)...]
+
+                if let hashes = content.range(of: "^#{1,6}[ \t]+", options: .regularExpression) {
+                    let title = content[hashes.upperBound...].trimmingCharacters(in: .whitespaces)
+                    return title.isEmpty ? String(line) : "\(indent)**\(title)**"
+                }
+                if let marker = content.range(of: "^[-*+][ \t]+", options: .regularExpression) {
+                    return "\(indent)•  \(content[marker.upperBound...])"
+                }
+                return String(line)
+            }
+            .joined(separator: "\n")
     }
 
     /// Wraps bare URLs in markdown link syntax so they render clickable too,

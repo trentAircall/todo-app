@@ -1,4 +1,5 @@
 import SwiftUI
+import ToDoCore
 
 /// The "New item" / "Edit item" form. Used for both creating a task or
 /// meeting from the UI and editing one you tap on. Quick, keyboard-only
@@ -8,7 +9,13 @@ struct TaskEditorSheet: View {
     @ObservedObject var store: TaskStore
     let editingTask: TaskItem?
     let defaultDate: Date
+    /// Set only when this sheet was opened via "Create Follow-up" on another
+    /// task — used purely to prefill title/tags/notes at init time.
+    let followUpFrom: TaskItem?
     let onDismiss: () -> Void
+    /// Tapped from the bottom bar on an existing task — asks the parent to
+    /// swap this sheet for a fresh one prefilled as a follow-up of `task`.
+    let onCreateFollowUp: (TaskItem) -> Void
 
     @State private var title: String
     @State private var kind: TaskKind
@@ -22,26 +29,55 @@ struct TaskEditorSheet: View {
     @State private var body_: String
     @State private var showDeleteConfirm = false
 
-    init(store: TaskStore, editingTask: TaskItem?, defaultDate: Date, onDismiss: @escaping () -> Void) {
+    init(
+        store: TaskStore,
+        editingTask: TaskItem?,
+        defaultDate: Date,
+        followUpFrom: TaskItem? = nil,
+        onDismiss: @escaping () -> Void,
+        onCreateFollowUp: @escaping (TaskItem) -> Void
+    ) {
         self.store = store
         self.editingTask = editingTask
         self.defaultDate = defaultDate
+        self.followUpFrom = followUpFrom
         self.onDismiss = onDismiss
+        self.onCreateFollowUp = onCreateFollowUp
 
         let cal = Calendar.current
         let defaultStart = cal.date(bySettingHour: 9, minute: 0, second: 0, of: defaultDate) ?? defaultDate
 
         if let task = editingTask {
+            // Anchor the time pickers on the task's OWN day, not the day
+            // that happens to be on screen. Only h:mm is read back on save,
+            // so this was invisible day to day — but building 9:00 on the
+            // wrong date is exactly how a DST-transition day produces a
+            // time that doesn't exist and silently shifts by an hour.
+            let taskDay = TaskFile.dateOnlyFormatter.date(from: task.dateString) ?? defaultDate
             _title = State(initialValue: task.title)
             _kind = State(initialValue: task.kind)
-            _date = State(initialValue: TaskFile.dateOnlyFormatter.date(from: task.dateString) ?? defaultDate)
+            _date = State(initialValue: taskDay)
             _hasTime = State(initialValue: task.startMinutes != nil)
-            _startTime = State(initialValue: Self.date(fromMinutes: task.startMinutes, on: defaultDate) ?? defaultStart)
+            _startTime = State(initialValue: Self.date(fromMinutes: task.startMinutes, on: taskDay) ?? defaultStart)
             _hasEndTime = State(initialValue: task.endMinutes != nil)
-            _endTime = State(initialValue: Self.date(fromMinutes: task.endMinutes, on: defaultDate) ?? defaultStart)
+            _endTime = State(initialValue: Self.date(fromMinutes: task.endMinutes, on: taskDay) ?? defaultStart)
             _tagsText = State(initialValue: task.tags.joined(separator: ", "))
             _link = State(initialValue: task.link?.absoluteString ?? "")
             _body_ = State(initialValue: task.rawBody.trimmingCharacters(in: .newlines))
+        } else if let source = followUpFrom {
+            // Prefilled from "Create Follow-up" — the provenance note lives
+            // as a plain line in the body (no new frontmatter key needed),
+            // so it shows up automatically in the row's description preview.
+            _title = State(initialValue: "Follow up: \(source.title)")
+            _kind = State(initialValue: .task)
+            _date = State(initialValue: defaultDate)
+            _hasTime = State(initialValue: false)
+            _startTime = State(initialValue: defaultStart)
+            _hasEndTime = State(initialValue: false)
+            _endTime = State(initialValue: defaultStart)
+            _tagsText = State(initialValue: source.tags.joined(separator: ", "))
+            _link = State(initialValue: "")
+            _body_ = State(initialValue: "**Follow-up from:** \(source.title) — \(TaskFile.shortDateLabel(source.dateString))\n\n")
         } else {
             _title = State(initialValue: "")
             _kind = State(initialValue: .task)
@@ -139,10 +175,16 @@ struct TaskEditorSheet: View {
             Divider()
 
             HStack {
-                if editingTask != nil {
+                if let task = editingTask {
                     Button("Delete", role: .destructive) {
                         showDeleteConfirm = true
                     }
+                    Button {
+                        onCreateFollowUp(task)
+                    } label: {
+                        Label("Follow-up", systemImage: "arrow.turn.up.right")
+                    }
+                    .help("Create a new task that notes it followed on from this one")
                 }
                 Spacer()
                 Button("Cancel") { onDismiss() }
