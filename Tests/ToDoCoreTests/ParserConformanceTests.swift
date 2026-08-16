@@ -150,9 +150,11 @@ final class ParserConformanceTests: XCTestCase {
         for testCase in cases.files where testCase.expected.hasFrontmatter {
             let (url, contents) = try fixtureFile(testCase.file)
             let task = TaskFile.parse(url: url, contents: contents)
-            // serialize(isDone:) with the value it already has is the
-            // smallest possible edit, so the output must be the input.
-            let out = TaskFile.serialize(task, isDone: task.isDone)
+            // Must be serializeUnchanged, not serialize(isDone: task.isDone):
+            // the latter rewrites the `done` line, which canonicalizes a
+            // file saying `done: yes` into `done: false` and so isn't an
+            // identity operation at all.
+            let out = TaskFile.serializeUnchanged(task)
             XCTAssertEqual(
                 out,
                 contents.replacingOccurrences(of: "\r\n", with: "\n"),

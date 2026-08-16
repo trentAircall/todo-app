@@ -131,9 +131,21 @@ public enum TaskFile {
         dateOnlyFormatter.string(from: date)
     }
 
+    private static let dateShapeRegex = try! NSRegularExpression(
+        pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    )
+
     /// True only for a well-formed *and* real "yyyy-MM-dd".
+    ///
+    /// The shape is checked explicitly before the formatter gets a look in:
+    /// DateFormatter happily parses "2026-8-16" against "yyyy-MM-dd" even
+    /// when non-lenient, but the JS side's regex requires zero-padding — so
+    /// leaving it to the formatter alone let the app accept a date the MCP
+    /// server would reject and silently reset to the creation day.
     public static func isDateString(_ value: String) -> Bool {
-        dateOnlyFormatter.date(from: value) != nil
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard dateShapeRegex.firstMatch(in: value, range: range) != nil else { return false }
+        return dateOnlyFormatter.date(from: value) != nil
     }
 
     private static let shortDateFormatter: DateFormatter = {
@@ -363,6 +375,18 @@ public enum TaskFile {
             lines.append("\(key): \(value)")
         }
         return lines
+    }
+
+    /// Re-serializes a task with no edits at all. For any file that had
+    /// frontmatter, the output must be byte-identical to what was read
+    /// (line endings normalized) — the preserve-everything guarantee in its
+    /// purest form, and what the conformance tests assert against.
+    ///
+    /// Note this is NOT the same as `serialize(task, isDone: task.isDone)`:
+    /// that one rewrites the `done` line, so a file saying `done: yes`
+    /// would come back canonicalized to `done: false`.
+    public static func serializeUnchanged(_ task: TaskItem) -> String {
+        applyingEdits(to: task) { $0 }
     }
 
     /// Re-serializes a task, flipping only the `done` value.
