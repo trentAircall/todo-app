@@ -189,6 +189,21 @@ test('effectiveRange applies the same floor the app uses', () => {
 // Finding the Tasks folder
 // ---------------------------------------------------------------------------
 
+// Every case below pins BOTH `pointerFile` and `legacyDefault` at paths
+// inside a temp dir. Without that, these tests pass or fail depending on
+// whether the machine running them happens to have ~/Developer/To-Do App/
+// Tasks — which is exactly how the override bug below reached a real Mac
+// after passing in a sandbox.
+function hermetic(base, overrides = {}) {
+  return {
+    env: {},
+    serverDir: path.join(base, 'mcp-server'),
+    pointerFile: path.join(base, 'no-pointer-file'),
+    legacyDefault: path.join(base, 'no-legacy-default'),
+    ...overrides,
+  };
+}
+
 test('a missing Tasks folder is an error, never a newly created decoy', () => {
   // Regression: the server hardcoded an absolute path and mkdirSync'd it, so
   // moving the project (which the README invites) made it recreate an empty
@@ -197,10 +212,7 @@ test('a missing Tasks folder is an error, never a newly created decoy', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-resolve-'));
   const missing = path.join(base, 'nowhere', 'Tasks');
   try {
-    const result = resolveTasksDir({
-      env: { TODO_APP_TASKS_DIR: missing },
-      serverDir: path.join(base, 'server'),
-    });
+    const result = resolveTasksDir(hermetic(base, { env: { TODO_APP_TASKS_DIR: missing } }));
     assert.ok(result.error, 'must report an error');
     assert.ok(!result.dir, 'must not resolve to anything');
     assert.match(result.error, /TODO_APP_TASKS_DIR/, 'names the thing to fix');
@@ -211,14 +223,56 @@ test('a missing Tasks folder is an error, never a newly created decoy', () => {
   }
 });
 
-test('an explicit override wins and is reported as the source', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-resolve-'));
+test('a broken override never silently falls back to another folder', () => {
+  // Regression: the override was merely FIRST in the candidate list, so
+  // pointing it at a bad path fell through to the legacy default. On a
+  // machine where that folder exists, the typo vanished and the server
+  // quietly used a folder the user hadn't asked for.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-resolve-'));
+  const decoy = path.join(base, 'decoy-that-exists');
   try {
-    const result = resolveTasksDir({ env: { TODO_APP_TASKS_DIR: dir }, serverDir: '/nonexistent' });
-    assert.strictEqual(result.dir, fs.realpathSync(dir) === dir ? dir : path.resolve(dir));
+    fs.mkdirSync(decoy);
+    const result = resolveTasksDir(
+      hermetic(base, {
+        env: { TODO_APP_TASKS_DIR: path.join(base, 'typo') },
+        legacyDefault: decoy,       // a perfectly good folder, deliberately
+        pointerFile: decoy,          // ...and a pointer file's worth of temptation
+      })
+    );
+    assert.ok(result.error, 'a bad override must fail, not redirect');
+    assert.ok(!result.dir);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('an explicit override wins and is reported as the source', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-resolve-'));
+  const dir = path.join(base, 'Tasks');
+  try {
+    fs.mkdirSync(dir);
+    const result = resolveTasksDir(hermetic(base, { env: { TODO_APP_TASKS_DIR: dir } }));
+    assert.strictEqual(result.dir, dir);
     assert.match(result.source, /environment variable/);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('the pointer file the app writes is preferred over the legacy default', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-resolve-'));
+  const moved = path.join(base, 'moved', 'Tasks');
+  const legacy = path.join(base, 'legacy');
+  const pointer = path.join(base, 'pointer');
+  try {
+    fs.mkdirSync(moved, { recursive: true });
+    fs.mkdirSync(legacy);
+    fs.writeFileSync(pointer, `${moved}\n`, 'utf8');
+    const result = resolveTasksDir(hermetic(base, { pointerFile: pointer, legacyDefault: legacy }));
+    assert.strictEqual(result.dir, moved, 'follows the app wherever it launched from');
+    assert.match(result.source, /last launch/);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
   }
 });
 
@@ -229,7 +283,7 @@ test('a sibling Tasks folder is found when running in place', () => {
   try {
     fs.mkdirSync(serverDir);
     fs.mkdirSync(tasksDir);
-    const result = resolveTasksDir({ env: {}, serverDir });
+    const result = resolveTasksDir(hermetic(base, { serverDir }));
     assert.strictEqual(result.dir, tasksDir);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
@@ -241,8 +295,20 @@ test('a file where the Tasks folder should be is not mistaken for one', () => {
   const notADir = path.join(base, 'Tasks');
   try {
     fs.writeFileSync(notADir, 'not a directory', 'utf8');
-    const result = resolveTasksDir({ env: { TODO_APP_TASKS_DIR: notADir }, serverDir: '/nonexistent' });
+    const result = resolveTasksDir(hermetic(base, { env: { TODO_APP_TASKS_DIR: notADir } }));
     assert.ok(result.error);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('nothing anywhere is an error that says what to do about it', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-resolve-'));
+  try {
+    const result = resolveTasksDir(hermetic(base));
+    assert.ok(result.error);
+    assert.match(result.error, /Launch the To-Do app once/);
+    assert.match(result.error, /TODO_APP_TASKS_DIR/);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

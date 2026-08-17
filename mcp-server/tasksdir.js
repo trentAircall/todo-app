@@ -42,9 +42,9 @@ function isUsableDirectory(candidate) {
   }
 }
 
-function readPointerFile() {
+function readPointerFile(pointerFile) {
   try {
-    const raw = fs.readFileSync(POINTER_FILE, 'utf8').trim();
+    const raw = fs.readFileSync(pointerFile, 'utf8').trim();
     return raw || null;
   } catch {
     return null;
@@ -62,28 +62,42 @@ function readPointerFile() {
  * Returns `{ dir }` on success, or `{ error }` with an actionable message.
  * Never creates anything.
  */
-function resolveTasksDir({ env = process.env, serverDir = __dirname } = {}) {
+function resolveTasksDir({
+  env = process.env,
+  serverDir = __dirname,
+  pointerFile = POINTER_FILE,
+  legacyDefault = LEGACY_DEFAULT,
+} = {}) {
+  // An explicit override is AUTHORITATIVE, not merely first in line. If it's
+  // set and unusable that's an error, full stop — falling through to the next
+  // candidate would quietly use a folder the user didn't ask for, which is
+  // the precise failure this module exists to prevent. (Caught by a test
+  // that passed in a sandbox and failed on a real machine, where the legacy
+  // default happened to exist and swallowed the mistake.)
+  const override = env.TODO_APP_TASKS_DIR;
+  if (override) {
+    if (isUsableDirectory(override)) {
+      return { dir: path.resolve(override), source: 'the TODO_APP_TASKS_DIR environment variable' };
+    }
+    return {
+      error:
+        `TODO_APP_TASKS_DIR is set to "${override}", but there's no folder there. ` +
+        `I won't fall back to somewhere else — you'd end up with tasks in two places and no ` +
+        `indication which. Fix the path, or unset it to use the location the To-Do app records ` +
+        `when it launches.`,
+    };
+  }
+
   const candidates = [
-    { source: 'the TODO_APP_TASKS_DIR environment variable', dir: env.TODO_APP_TASKS_DIR },
-    { source: 'the location recorded by the app at its last launch', dir: readPointerFile() },
+    { source: 'the location recorded by the app at its last launch', dir: readPointerFile(pointerFile) },
     { source: 'the Tasks folder next to this server', dir: path.join(serverDir, '..', 'Tasks') },
-    { source: 'the default project location', dir: LEGACY_DEFAULT },
+    { source: 'the default project location', dir: legacyDefault },
   ].filter((candidate) => candidate.dir);
 
   for (const candidate of candidates) {
     if (isUsableDirectory(candidate.dir)) {
       return { dir: path.resolve(candidate.dir), source: candidate.source };
     }
-  }
-
-  // An explicit override that doesn't exist is a typo, and deserves a
-  // different message from "I looked everywhere and found nothing."
-  if (env.TODO_APP_TASKS_DIR) {
-    return {
-      error:
-        `TODO_APP_TASKS_DIR is set to "${env.TODO_APP_TASKS_DIR}", but no folder exists there. ` +
-        `Fix the path or unset it to fall back to the location the To-Do app records when it launches.`,
-    };
   }
 
   return {
