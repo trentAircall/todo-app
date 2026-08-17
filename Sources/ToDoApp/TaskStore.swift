@@ -260,7 +260,7 @@ final class TaskStore: ObservableObject {
         // Quick-add has nowhere to put an error and nothing to lose if it
         // fails (the field is one line, still on screen); the alert from
         // `report` is the whole story here.
-        try? createTask(
+        _ = try? createTask(
             title: trimmed,
             kind: .task,
             dateString: dateString,

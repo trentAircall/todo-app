@@ -310,7 +310,11 @@ final class ParserConformanceTests: XCTestCase {
             startMinutes: nil, endMinutes: nil, tags: [], link: nil,
             createdAt: Date(), rawFrontmatterLines: [], rawBody: body
         )
-        XCTAssertEqual(task.bodyPreview, "Real prep notes.\n\n")
+        // Everything up to but not including the heading's own line. The
+        // blank line between the notes and the heading is kept; the newline
+        // that separated it FROM the heading is not, because that separator
+        // belonged to the line being dropped.
+        XCTAssertEqual(task.bodyPreview, "Real prep notes.\n")
         XCTAssertFalse(task.bodyPreview.contains("Drive doc linked"))
 
         // A body with no log is passed through untouched.
