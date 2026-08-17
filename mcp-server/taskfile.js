@@ -74,8 +74,12 @@ function isDateString(value) {
   if (typeof value !== 'string' || !DATE_RE.test(value)) return false;
   const [y, m, d] = value.split('-').map(Number);
   if (m < 1 || m > 12 || d < 1) return false;
-  const probe = new Date(y, m - 1, d);
-  return probe.getFullYear() === y && probe.getMonth() === m - 1 && probe.getDate() === d;
+  // Calendar arithmetic, not `new Date(y, ...)`: that constructor remaps
+  // two-digit years to 1900+y, so the round-trip check failed for every
+  // year 0001–0099 while Swift's DateFormatter accepted them.
+  const isLeap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const daysInMonth = [31, isLeap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
+  return d <= daysInMonth;
 }
 
 function shortDateLabel(dateString) {
@@ -164,11 +168,24 @@ function isoNoMillis(date) {
 }
 
 /**
+ * An identity token for a file's current contents, used as the
+ * optimistic-concurrency check in writeAtomically. mtime alone can be
+ * reused after a fast rename-into-place, so size and inode ride along.
+ */
+function signatureOf(stat) {
+  return `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
+}
+
+function fileSignature(filePath) {
+  return signatureOf(fs.statSync(filePath));
+}
+
+/**
  * Parses one task file's raw text. Never throws — a malformed file degrades
  * to a filename-titled task rather than being skipped or destroyed.
  *
  * `stat` is optional and passed in by loadAllTasks so a directory scan does
- * one stat per file instead of two. `modifiedAtMs` rides along on the result
+ * one stat per file instead of two. `signature` rides along on the result
  * and is what writeAtomically checks to catch a lost update.
  */
 function parseTask(filePath, contents, stat) {
@@ -177,16 +194,16 @@ function parseTask(filePath, contents, stat) {
   const lines = normalized.split('\n');
 
   let birthtime;
-  let modifiedAtMs = null;
+  let signature = null;
   try {
     const st = stat || fs.statSync(filePath);
     birthtime = st.birthtime;
-    modifiedAtMs = st.mtimeMs;
+    signature = signatureOf(st);
   } catch {
     birthtime = new Date();
   }
 
-  const base = { id, filePath, modifiedAtMs };
+  const base = { id, filePath, signature };
 
   const fallback = () => ({
     ...base,
@@ -278,19 +295,59 @@ function loadAllTasks(tasksDir) {
   return out;
 }
 
-/** The single mutation primitive — mirrors TaskFile.setValue exactly. */
+/**
+ * Collapses anything that would break the one-key-per-line frontmatter
+ * grammar into a single space.
+ *
+ * Values reach here straight from an LLM via `z.string()`, which happily
+ * permits newlines. A title of "Catchup\n---" spliced a second `---` fence
+ * into the middle of the frontmatter: everything below it became body text,
+ * so a timed, tagged meeting with a `source:` key silently became an
+ * untitled task on today — and the tool reported success. `date` was
+ * validated against exactly this; every other field was not.
+ */
+function sanitizeValue(value) {
+  return String(value)
+    // C0/C1 controls, DEL, NEL, and the Unicode line/paragraph separators.
+    // Any of these terminates a line for one parser or the other, and a
+    // frontmatter value that spans two lines is a corrupt file.
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * The single mutation primitive — mirrors TaskFile.setValue exactly.
+ *
+ * Rewrites the FIRST line matching `key` and deletes any later duplicates,
+ * because `parseTask` takes the LAST occurrence of a repeated key. With
+ * first-write/last-read, a file that somehow grew two `done:` lines could
+ * never be toggled: the write landed on line 1, the read came from line 5,
+ * and the checkbox snapped straight back with no error.
+ */
 function setValue(lines, key, value) {
-  const idx = lines.findIndex((l) => keyOf(l) === key);
-  if (idx !== -1) {
-    if (value !== null) {
-      const copy = lines.slice();
-      copy[idx] = `${key}: ${value}`;
-      return copy;
-    }
-    return lines.filter((_, i) => i !== idx);
+  const matches = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (keyOf(lines[i]) === key) matches.push(i);
   }
-  if (value !== null) return [...lines, `${key}: ${value}`];
-  return lines;
+
+  if (!matches.length) {
+    return value === null ? lines : [...lines, `${key}: ${sanitizeValue(value)}`];
+  }
+
+  const first = matches[0];
+  const duplicates = new Set(matches.slice(1));
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (duplicates.has(i)) continue;
+    if (i === first) {
+      if (value === null) continue;
+      out.push(`${key}: ${sanitizeValue(value)}`);
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out;
 }
 
 /** Re-serializes a task, applying `editFn` to its frontmatter lines only —
@@ -308,18 +365,23 @@ function serializeWithEdits(task, editFn, newBody) {
 }
 
 function newFileContents({ title, kind, dateString, startMinutes, endMinutes, tags, link, source, body, createdAt }) {
+  // Every frontmatter value goes through sanitizeValue for the same reason
+  // setValue does: a newline anywhere in here splices a second `---` fence
+  // into the block and the file is born corrupt. The body is exempt — it
+  // lives below the fence, where newlines are the whole point.
   const lines = [];
-  lines.push(`title: ${title}`);
+  lines.push(`title: ${sanitizeValue(title)}`);
   if (kind === 'meeting') lines.push('kind: meeting');
   lines.push('done: false');
-  lines.push(`date: ${dateString}`);
+  lines.push(`date: ${sanitizeValue(dateString)}`);
   if (startMinutes != null) lines.push(`start: ${formatMinutesHHmm(startMinutes)}`);
   if (endMinutes != null) lines.push(`end: ${formatMinutesHHmm(endMinutes)}`);
-  if (tags && tags.length) lines.push(`tags: ${tags.join(', ')}`);
-  const trimmedLink = (link || '').trim();
-  if (trimmedLink) lines.push(`link: ${trimmedLink}`);
-  const trimmedSource = (source || '').trim();
-  if (trimmedSource) lines.push(`source: ${trimmedSource}`);
+  const cleanTags = (tags || []).map(sanitizeValue).filter(Boolean);
+  if (cleanTags.length) lines.push(`tags: ${cleanTags.join(', ')}`);
+  const cleanLink = sanitizeValue(link || '');
+  if (cleanLink) lines.push(`link: ${cleanLink}`);
+  const cleanSource = sanitizeValue(source || '');
+  if (cleanSource) lines.push(`source: ${cleanSource}`);
   lines.push(`created: ${isoNoMillis(createdAt)}`);
   const trimmedBody = body ? `\n${body}` : '';
   return '---\n' + lines.join('\n') + '\n---\n' + trimmedBody;
@@ -333,13 +395,31 @@ const ENRICHMENT_HEADING = '## Enrichment log';
 // "add a line at the very end" — no need to find/parse an existing section
 // to insert into the middle of it.
 function appendEnrichmentEntry(body, entry) {
-  const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
-  const line = `- ${timestamp}: ${entry}`;
-  const trimmed = body.replace(/\s+$/, '');
-  if (trimmed.includes(ENRICHMENT_HEADING)) {
-    return `${trimmed}\n${line}\n`;
+  // Local time, not toISOString(). Everything else in this app buckets by
+  // the local calendar day; a UTC stamp here made the provenance line claim
+  // the wrong DAY for anyone west of Greenwich.
+  const now = new Date();
+  const timestamp = `${dateStringOf(now)} ${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
+  const line = `- ${timestamp}: ${sanitizeValue(entry)}`;
+
+  // Match the heading as a whole line. A substring test treated "### Enrichment
+  // log" (and a passing mention in prose) as the section, and appending to the
+  // end of the BODY rather than to the section meant an entry could land under
+  // whatever heading the user happened to add afterwards.
+  const lines = body.split('\n');
+  const headingIndex = lines.findIndex((line) => line.trim() === ENRICHMENT_HEADING);
+
+  if (headingIndex === -1) {
+    // Only trailing newlines are stripped — trailing spaces can be a
+    // markdown hard line break, which is the author's, not ours to remove.
+    const trimmed = body.replace(/\n+$/, '');
+    return (trimmed ? `${trimmed}\n\n` : '') + `${ENRICHMENT_HEADING}\n${line}\n`;
   }
-  return (trimmed ? trimmed + '\n\n' : '') + `${ENRICHMENT_HEADING}\n${line}\n`;
+
+  let insertAt = headingIndex + 1;
+  while (insertAt < lines.length && /^-\s/.test(lines[insertAt])) insertAt++;
+  lines.splice(insertAt, 0, line);
+  return lines.join('\n');
 }
 
 function uniqueFilePath(tasksDir, filename) {
@@ -367,23 +447,33 @@ function uniqueFilePath(tasksDir, filename) {
  * a clean StaleWriteError instead of quiet data loss. Omit it for brand-new
  * files, which by definition have nothing to clobber.
  */
-function writeAtomically(filePath, contents, expectedMtimeMs) {
-  if (expectedMtimeMs != null) {
-    let current = null;
+function writeAtomically(filePath, contents, expectedSignature) {
+  const check = () => {
+    if (expectedSignature == null) return;
+    let current;
     try {
-      current = fs.statSync(filePath).mtimeMs;
+      current = fileSignature(filePath);
     } catch {
       throw new StaleWriteError(filePath); // deleted out from under us
     }
-    // Filesystem mtime resolution is coarser than JS floats in some cases;
-    // 1ms of slack avoids spurious failures without weakening the check.
-    if (Math.abs(current - expectedMtimeMs) > 1) throw new StaleWriteError(filePath);
-  }
+    // Strict equality, no tolerance window. The previous 1ms of slack was
+    // wider than the entire read→write gap inside a tool call (measured at
+    // 0.02–0.55ms), so the check could not fire in the situation it exists
+    // for. Coarse filesystem timestamps make mtime MORE stable, not less,
+    // so the slack bought nothing and cost the whole guarantee.
+    if (current !== expectedSignature) throw new StaleWriteError(filePath);
+  };
+
+  check();
 
   const dir = path.dirname(filePath);
   const tmp = path.join(dir, `.${crypto.randomUUID()}.tmp`);
   try {
     fs.writeFileSync(tmp, contents, 'utf8');
+    // Re-check with the replacement already staged, so the window between
+    // "we looked" and "we swapped" is just the rename syscall itself —
+    // which is atomic within a directory.
+    check();
     fs.renameSync(tmp, filePath);
   } catch (err) {
     try { fs.unlinkSync(tmp); } catch { /* best effort */ }
@@ -418,6 +508,9 @@ module.exports = {
   DATE_RE,
   StaleWriteError,
   ENRICHMENT_HEADING,
+  sanitizeValue,
+  signatureOf,
+  fileSignature,
   dateStringOf,
   todayString,
   isDateString,

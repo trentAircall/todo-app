@@ -66,6 +66,11 @@
     { "input": "2026-00-10", "expected": false },
     { "input": "2026-08-00", "expected": false },
     { "input": "2026-8-16", "expected": false, "note": "must be zero-padded" },
+    { "input": "0026-08-16", "expected": true,
+      "regression": "JS used new Date(y, m, d), which remaps two-digit years to 1900+y, so every year 0001-0099 failed its own round-trip check while Swift accepted it." },
+    { "input": "0099-12-31", "expected": true },
+    { "input": "2400-02-29", "expected": true, "note": "divisible by 400, so a leap year" },
+    { "input": "2500-02-29", "expected": false, "note": "divisible by 100 but not 400" },
     { "input": "tomorrow", "expected": false },
     { "input": "", "expected": false }
   ],
@@ -178,6 +183,23 @@
         "tags": [],
         "link": "https://example.com:8443/room?id=1",
         "hasFrontmatter": true
+      }
+    },
+    {
+      "name": "duplicate-keys",
+      "note": "A file that grew a repeated key (bad merge, hand-edit, paste). The LAST occurrence wins on read, so setValue must rewrite the first and delete the rest — otherwise the write lands on a line nobody reads and e.g. a checkbox can never be toggled.",
+      "file": "duplicate-keys.md",
+      "expected": {
+        "title": "Task with repeated keys",
+        "kind": "task",
+        "done": true,
+        "dateString": "2026-09-11",
+        "startMinutes": 540,
+        "endMinutes": null,
+        "tags": [],
+        "link": null,
+        "hasFrontmatter": true,
+        "body": "\nBody text.\n"
       }
     },
     {

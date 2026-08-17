@@ -65,11 +65,32 @@ struct MarkdownText: View {
         for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
             let range = match.range
             result += ns.substring(with: NSRange(location: lastIndex, length: range.location - lastIndex))
-            let urlString = ns.substring(with: range)
-            let precededByParen = range.location > 0
-                && ns.substring(with: NSRange(location: range.location - 1, length: 1)) == "("
-            result += precededByParen ? urlString : "[\(urlString)](\(urlString))"
             lastIndex = range.location + range.length
+
+            // Only skip a URL that's already the target of a markdown link —
+            // i.e. preceded by "](", not by any old "(". Checking for a bare
+            // paren meant "Zoom (https://zoom.us/j/1)" — a very common shape
+            // in pasted calendar invites — rendered as dead plain text.
+            let alreadyLinked = range.location >= 2
+                && ns.substring(with: NSRange(location: range.location - 2, length: 2)) == "]("
+            if alreadyLinked {
+                result += ns.substring(with: range)
+                continue
+            }
+
+            // Sentence punctuation isn't part of the URL. "See https://x.com."
+            // used to link to "https://x.com." including the full stop.
+            var urlString = ns.substring(with: range)
+            var trailing = ""
+            while let last = urlString.last, ".,;:!?".contains(last) {
+                trailing.insert(last, at: trailing.startIndex)
+                urlString.removeLast()
+            }
+            if urlString.isEmpty {
+                result += trailing
+                continue
+            }
+            result += "[\(urlString)](\(urlString))" + trailing
         }
         result += ns.substring(with: NSRange(location: lastIndex, length: ns.length - lastIndex))
         return result

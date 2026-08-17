@@ -28,6 +28,11 @@ struct TaskEditorSheet: View {
     @State private var link: String
     @State private var body_: String
     @State private var showDeleteConfirm = false
+    /// Set when a save fails. The sheet stays open and shows this, because
+    /// the failure that matters most — someone else changed the file while
+    /// you were typing — is exactly the one where dismissing would throw
+    /// away the text you'd just written.
+    @State private var saveError: String?
 
     init(
         store: TaskStore,
@@ -196,6 +201,15 @@ struct TaskEditorSheet: View {
             .padding()
         }
         .frame(width: 460, height: 620)
+        .alert(
+            "Couldn't save this item.",
+            isPresented: Binding(get: { saveError != nil }, set: { if !$0 { saveError = nil } }),
+            presenting: saveError
+        ) { _ in
+            Button("OK", role: .cancel) { saveError = nil }
+        } message: { message in
+            Text(message)
+        }
         .confirmationDialog(
             "Delete this item?",
             isPresented: $showDeleteConfirm,
@@ -214,6 +228,7 @@ struct TaskEditorSheet: View {
     }
 
     private func save() {
+        saveError = nil
         let dateString = TaskFile.dateOnlyFormatter.string(from: date)
         let startMinutes = hasTime ? Self.minutes(from: startTime) : nil
         let endMinutes = (hasTime && hasEndTime) ? Self.minutes(from: endTime) : nil
@@ -222,29 +237,36 @@ struct TaskEditorSheet: View {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
 
-        if let task = editingTask {
-            store.updateTask(
-                task,
-                title: title,
-                kind: kind,
-                dateString: dateString,
-                startMinutes: startMinutes,
-                endMinutes: endMinutes,
-                tags: tags,
-                link: link,
-                body: body_
-            )
-        } else {
-            store.createTask(
-                title: title,
-                kind: kind,
-                dateString: dateString,
-                startMinutes: startMinutes,
-                endMinutes: endMinutes,
-                tags: tags,
-                link: link,
-                body: body_
-            )
+        do {
+            if let task = editingTask {
+                try store.updateTask(
+                    task,
+                    title: title,
+                    kind: kind,
+                    dateString: dateString,
+                    startMinutes: startMinutes,
+                    endMinutes: endMinutes,
+                    tags: tags,
+                    link: link,
+                    body: body_
+                )
+            } else {
+                try store.createTask(
+                    title: title,
+                    kind: kind,
+                    dateString: dateString,
+                    startMinutes: startMinutes,
+                    endMinutes: endMinutes,
+                    tags: tags,
+                    link: link,
+                    body: body_
+                )
+            }
+        } catch {
+            // Deliberately no onDismiss() here. Everything the user typed is
+            // in this sheet's @State and nowhere else yet.
+            saveError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return
         }
         onDismiss()
     }

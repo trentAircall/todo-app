@@ -37,12 +37,13 @@ public struct TaskItem: Identifiable, Equatable, Sendable {
     public var link: URL?
     public var createdAt: Date
 
-    /// The file's modification date at the moment it was read. This is the
-    /// optimistic-concurrency token: the app and the MCP server both do
-    /// read-modify-write on the whole file, so `TaskStore` re-checks this
-    /// immediately before saving and refuses to write over a file that
-    /// someone else has touched since. `nil` if it couldn't be read.
-    public var modifiedAt: Date?
+    /// An opaque identity token for the file's contents at the moment it
+    /// was read (mtime, size, inode). This is the optimistic-concurrency
+    /// token: the app and the MCP server both do read-modify-write on the
+    /// whole file, so `TaskStore` re-checks it immediately before saving and
+    /// refuses to write over a file someone else has touched since. `nil` if
+    /// it couldn't be read. Compared only for equality — never parsed.
+    public var signature: String?
 
     /// Raw frontmatter lines (between the `---` fences) exactly as read from
     /// disk, in original order — including comments, blank lines, and any
@@ -68,7 +69,7 @@ public struct TaskItem: Identifiable, Equatable, Sendable {
         tags: [String],
         link: URL?,
         createdAt: Date,
-        modifiedAt: Date? = nil,
+        signature: String? = nil,
         rawFrontmatterLines: [String]?,
         rawBody: String
     ) {
@@ -82,7 +83,7 @@ public struct TaskItem: Identifiable, Equatable, Sendable {
         self.tags = tags
         self.link = link
         self.createdAt = createdAt
-        self.modifiedAt = modifiedAt
+        self.signature = signature
         self.rawFrontmatterLines = rawFrontmatterLines
         self.rawBody = rawBody
     }
@@ -93,9 +94,18 @@ public struct TaskItem: Identifiable, Equatable, Sendable {
     /// off. The log is machine-appended provenance that grows without
     /// bound; in a three-line row preview it would push the actual prep
     /// notes out of view, which is the opposite of what the row is for.
+    ///
+    /// The heading must be a whole line. An unanchored substring search
+    /// also matched "### Enrichment log" (which contains it at offset one,
+    /// so the preview truncated and left a dangling `#`) and any passing
+    /// mention of the phrase in prose.
     public var bodyPreview: String {
-        guard let range = rawBody.range(of: TaskFile.enrichmentHeading) else { return rawBody }
-        return String(rawBody[rawBody.startIndex..<range.lowerBound])
+        var kept: [String] = []
+        for line in rawBody.components(separatedBy: "\n") {
+            if line.trimmingCharacters(in: .whitespaces) == TaskFile.enrichmentHeading { break }
+            kept.append(line)
+        }
+        return kept.joined(separator: "\n")
     }
 }
 
@@ -118,10 +128,15 @@ public enum TaskFile {
 
     /// Non-lenient by design: "2026-02-31" must parse as nil, not roll
     /// forward into March. mcp-server's `isDateString` matches this.
+    ///
+    /// `timeZone` is deliberately NOT assigned. An explicitly-set time zone
+    /// is pinned at first use and stops tracking the system, so after the
+    /// machine's zone changes (travel, a DST-rule update) this would keep
+    /// bucketing days in the old zone while `Calendar.current` elsewhere in
+    /// the app, and `dateStringOf` in the MCP server, both moved on.
     public static let dateOnlyFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
-        f.timeZone = .current
         f.locale = Locale(identifier: "en_US_POSIX")
         f.isLenient = false
         return f
@@ -168,12 +183,11 @@ public enum TaskFile {
     /// Parses a task file's raw text into a `TaskItem`. Never throws —
     /// malformed files degrade gracefully (title = filename) rather than
     /// being skipped or deleted.
-    public static func parse(url: URL, contents: String, modifiedAt: Date? = nil) -> TaskItem {
+    public static func parse(url: URL, contents: String, signature: String? = nil) -> TaskItem {
         let normalized = contents.replacingOccurrences(of: "\r\n", with: "\n")
         let lines = normalized.components(separatedBy: "\n")
 
-        let attributes = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-        let resolvedModifiedAt = modifiedAt ?? attributes?.contentModificationDate
+        let attributes = try? url.resourceValues(forKeys: [.creationDateKey])
 
         guard lines.first?.trimmingCharacters(in: .whitespaces) == "---",
               let closingIndex = lines.dropFirst().firstIndex(where: {
@@ -197,7 +211,7 @@ public enum TaskFile {
                 tags: [],
                 link: nil,
                 createdAt: createdAt,
-                modifiedAt: resolvedModifiedAt,
+                signature: signature,
                 rawFrontmatterLines: nil,
                 rawBody: normalized
             )
@@ -260,7 +274,7 @@ public enum TaskFile {
             tags: tags,
             link: linkRaw.flatMap { URL(string: $0.trimmingCharacters(in: .whitespaces)) },
             createdAt: resolvedCreatedAt,
-            modifiedAt: resolvedModifiedAt,
+            signature: signature,
             rawFrontmatterLines: frontmatterLines,
             rawBody: body
         )
@@ -363,18 +377,61 @@ public enum TaskFile {
     /// untouched, in its original position. This is the single mutation
     /// path used by every save, so the preserve-unknown-data guarantee
     /// holds everywhere, not just for `done`.
+    /// Anything that would end a line, as far as either parser is concerned.
+    /// Deliberately NOT all of Unicode's format category — that would catch
+    /// zero-width joiners and break emoji, which titles are allowed to have.
+    private static let lineBreakingCharacters: CharacterSet = {
+        var set = CharacterSet()
+        set.insert(charactersIn: Unicode.Scalar(0x00)!...Unicode.Scalar(0x1F)!) // C0 controls
+        set.insert(charactersIn: Unicode.Scalar(0x7F)!...Unicode.Scalar(0x9F)!) // DEL + C1
+        set.insert(Unicode.Scalar(0x2028)!) // LINE SEPARATOR
+        set.insert(Unicode.Scalar(0x2029)!) // PARAGRAPH SEPARATOR
+        set.insert(Unicode.Scalar(0xFEFF)!) // ZERO WIDTH NO-BREAK SPACE / BOM
+        return set
+    }()
+
+    /// Collapses anything that would break the one-key-per-line frontmatter
+    /// grammar into a single space. Mirrors `sanitizeValue` in
+    /// mcp-server/taskfile.js.
+    ///
+    /// A title containing a newline used to splice a second `---` fence into
+    /// the middle of the frontmatter: every key below it fell into the body,
+    /// so a timed, tagged meeting silently became an untitled task on today.
+    public static func sanitizedValue(_ value: String) -> String {
+        value
+            .components(separatedBy: lineBreakingCharacters)
+            .joined(separator: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
     public static func setValue(_ value: String?, forKey key: String, in lines: [String]) -> [String] {
-        var lines = lines
-        if let idx = lines.firstIndex(where: { keyOf($0) == key }) {
-            if let value {
-                lines[idx] = "\(key): \(value)"
-            } else {
-                lines.remove(at: idx)
-            }
-        } else if let value {
-            lines.append("\(key): \(value)")
+        let matches = lines.indices.filter { keyOf(lines[$0]) == key }
+
+        guard let first = matches.first else {
+            guard let value else { return lines }
+            return lines + ["\(key): \(sanitizedValue(value))"]
         }
-        return lines
+
+        // Rewrite the FIRST match and drop any later duplicates, because
+        // `parse` above takes the LAST occurrence of a repeated key. With
+        // first-write/last-read, a file that somehow grew two `done:` lines
+        // could never be toggled: the write landed on line 1, the read came
+        // from line 5, and the checkbox snapped straight back with no error.
+        let duplicates = Set(matches.dropFirst())
+        var out: [String] = []
+        out.reserveCapacity(lines.count)
+        for index in lines.indices {
+            if duplicates.contains(index) { continue }
+            if index == first {
+                guard let value else { continue }
+                out.append("\(key): \(sanitizedValue(value))")
+                continue
+            }
+            out.append(lines[index])
+        }
+        return out
     }
 
     /// Re-serializes a task with no edits at all. For any file that had
@@ -458,16 +515,21 @@ public enum TaskFile {
         body: String,
         createdAt: Date
     ) -> String {
+        // Every value goes through sanitizedValue for the same reason
+        // setValue does: a newline here splices a second `---` fence into the
+        // block and the file is born corrupt. The body is exempt — it lives
+        // below the fence, where newlines are the whole point.
         var lines: [String] = []
-        lines.append("title: \(title)")
+        lines.append("title: \(sanitizedValue(title))")
         if kind == .meeting { lines.append("kind: meeting") }
         lines.append("done: false")
-        lines.append("date: \(dateString)")
+        lines.append("date: \(sanitizedValue(dateString))")
         if let startMinutes { lines.append("start: \(formatMinutesHHmm(startMinutes))") }
         if let endMinutes { lines.append("end: \(formatMinutesHHmm(endMinutes))") }
-        if !tags.isEmpty { lines.append("tags: \(tags.joined(separator: ", "))") }
-        let trimmedLink = link.trimmingCharacters(in: .whitespaces)
-        if !trimmedLink.isEmpty { lines.append("link: \(trimmedLink)") }
+        let cleanTags = tags.map(sanitizedValue).filter { !$0.isEmpty }
+        if !cleanTags.isEmpty { lines.append("tags: \(cleanTags.joined(separator: ", "))") }
+        let cleanLink = sanitizedValue(link)
+        if !cleanLink.isEmpty { lines.append("link: \(cleanLink)") }
         lines.append("created: \(isoFormatter.string(from: createdAt))")
         let trimmedBody = body.isEmpty ? "" : "\n\(body)"
         return "---\n" + lines.joined(separator: "\n") + "\n---\n" + trimmedBody

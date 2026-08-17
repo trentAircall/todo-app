@@ -6,7 +6,8 @@ import AppKit
 /// The menu bar "what's next" glance — a quick read of what's happening now
 /// and what's coming up today, without switching to the main window. Reuses
 /// the same `TaskStore` the main window watches, so it's never stale by more
-/// than the store's own ~1s poll.
+/// than the store's own backstop poll — and usually not at all, since the
+/// directory watcher fires as soon as a file changes.
 struct MenuBarView: View {
     @ObservedObject var store: TaskStore
     @Environment(\.openWindow) private var openWindow

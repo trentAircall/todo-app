@@ -317,6 +317,91 @@ final class ParserConformanceTests: XCTestCase {
         var plain = task
         plain.rawBody = "Just notes."
         XCTAssertEqual(plain.bodyPreview, "Just notes.")
+
+        // The heading must be a whole line: an h3 that merely contains the
+        // phrase, or a passing mention in prose, must not truncate anything.
+        var h3 = task
+        h3.rawBody = "### Enrichment log\nstill notes"
+        XCTAssertEqual(h3.bodyPreview, "### Enrichment log\nstill notes")
+
+        var prose = task
+        prose.rawBody = "See the ## Enrichment log below for sources."
+        XCTAssertEqual(prose.bodyPreview, "See the ## Enrichment log below for sources.")
+    }
+
+    // MARK: - Frontmatter injection
+
+    func testANewlineInAValueCannotBreakOutOfItsLine() {
+        // Regression: a title containing "\n---" spliced a second fence into
+        // the frontmatter. Every key below it fell into the body, so a timed,
+        // tagged meeting silently became an untitled task on today.
+        let hostile = [
+            "Catchup\n---\nrogue: injected",
+            "Catchup\r\ndate: 1999-01-01",
+            "Catchup\u{2028}date: 1999-01-01",
+            "Catchup\tand a tab",
+        ]
+        for title in hostile {
+            let line = TaskFile.setValue(title, forKey: "title", in: [])[0]
+            XCTAssertEqual(
+                line.components(separatedBy: "\n").count, 1,
+                "produced multiple lines for \(title.debugDescription)"
+            )
+            XCTAssertFalse(line.contains("\r"))
+            XCTAssertFalse(line.contains("\u{2028}"))
+        }
+    }
+
+    func testAnInjectedTitleCannotChangeHowTheFileParses() {
+        let contents = TaskFile.newFileContents(
+            title: "Catchup\n---\nrogue: injected",
+            kind: .meeting,
+            dateString: "2026-09-01",
+            startMinutes: 600,
+            endMinutes: 660,
+            tags: ["external\n---"],
+            link: "",
+            body: "Prep notes.",
+            createdAt: Date()
+        )
+        let task = TaskFile.parse(url: URL(fileURLWithPath: "/tmp/injected.md"), contents: contents)
+        XCTAssertEqual(task.kind, .meeting, "still a meeting")
+        XCTAssertEqual(task.dateString, "2026-09-01", "still on the requested day")
+        XCTAssertEqual(task.startMinutes, 600, "still timed")
+
+        let fences = contents.components(separatedBy: "\n").filter { $0 == "---" }
+        XCTAssertEqual(fences.count, 2, "exactly two fences")
+    }
+
+    func testSanitizedValueCollapsesRatherThanDeletes() {
+        XCTAssertEqual(TaskFile.sanitizedValue("Catchup\n---"), "Catchup ---")
+        XCTAssertEqual(TaskFile.sanitizedValue("  spaced   out  "), "spaced out")
+        XCTAssertEqual(TaskFile.sanitizedValue("Ünïcödé stays"), "Ünïcödé stays", "non-ASCII text is not mangled")
+        XCTAssertEqual(TaskFile.sanitizedValue("emoji 👍 stays"), "emoji 👍 stays")
+    }
+
+    // MARK: - Duplicate keys
+
+    func testWritingAKeyRemovesLaterDuplicates() throws {
+        // Regression: parse takes the LAST occurrence, setValue rewrote the
+        // FIRST. A file with two `done:` lines could never be toggled — the
+        // write landed on line 1, the read came from line 5, and the
+        // checkbox snapped straight back with no error.
+        let out = TaskFile.setValue("false", forKey: "done", in: ["done: false", "title: X", "done: true"])
+        XCTAssertEqual(out, ["done: false", "title: X"])
+
+        let removed = TaskFile.setValue(nil, forKey: "start", in: ["start: 09:00", "x: 1", "start: 10:00"])
+        XCTAssertEqual(removed, ["x: 1"])
+    }
+
+    func testADuplicatedKeyCanActuallyBeToggled() throws {
+        let (url, contents) = try fixtureFile("duplicate-keys.md")
+        let task = TaskFile.parse(url: url, contents: contents)
+        XCTAssertTrue(task.isDone, "the last occurrence is what the parser sees")
+
+        let written = TaskFile.serialize(task, isDone: false)
+        let reparsed = TaskFile.parse(url: url, contents: written)
+        XCTAssertFalse(reparsed.isDone, "un-ticking it must actually stick")
     }
 
     // MARK: - Overlap detection

@@ -33,6 +33,7 @@ const {
   StaleWriteError,
 } = require('./taskfile');
 const { resolveTask, formatTaskLine, formatCandidates } = require('./resolve');
+const { resolveTasksDir } = require('./tasksdir');
 const {
   addDays,
   dayOfWeekLabel,
@@ -48,22 +49,24 @@ function nowMinutes() {
   return d.getHours() * 60 + d.getMinutes();
 }
 
-// NOT __dirname-relative: Claude Desktop's "Install Unpackaged Extension"
-// copies this folder into its own managed extensions directory rather than
-// running it in place, so a relative path silently resolves to a decoy
-// sibling folder there instead of the app's real Tasks/. This must stay a
-// real absolute path to the one true Tasks folder regardless of where this
-// server itself ends up running from. Override with TODO_APP_TASKS_DIR if
-// this project ever moves.
-const TASKS_DIR = process.env.TODO_APP_TASKS_DIR || '/Users/thome/Developer/To-Do App/Tasks';
-try {
-  fs.mkdirSync(TASKS_DIR, { recursive: true });
-} catch (err) {
-  console.error(`[todo-mcp] could not create Tasks dir: ${err.message}`);
-}
+// See tasksdir.js for why this isn't a hardcoded path and isn't created if
+// missing. Resolved once at startup: the folder doesn't move mid-session,
+// and re-checking on every call would just add stat noise.
+const resolvedTasksDir = resolveTasksDir();
+const TASKS_DIR = resolvedTasksDir.dir || null;
 
 function text(s) {
   return { content: [{ type: 'text', text: s }] };
+}
+
+/**
+ * Every tool goes through this first. If the Tasks folder couldn't be found,
+ * the honest answer is "I don't know where your tasks are" — not an empty
+ * list, and certainly not a new empty folder that quietly becomes a second
+ * home for everything Claude writes from here on.
+ */
+function tasksDirError() {
+  return resolvedTasksDir.error ? text(resolvedTasksDir.error) : null;
 }
 
 function loadTasks() {
@@ -155,6 +158,11 @@ function summarizeArgs(args) {
 function safeHandler(name, fn) {
   return async (args) => {
     log(`call ${name} ${summarizeArgs(args)}`);
+    const unresolved = tasksDirError();
+    if (unresolved) {
+      log(`refused ${name}: Tasks folder unresolved`);
+      return unresolved;
+    }
     try {
       const result = await fn(args);
       log(`ok ${name}`);
@@ -512,6 +520,16 @@ server.registerTool(
       endMinutes = parseTimeToMinutes(end);
       if (endMinutes == null) return text(`Couldn't understand the end time "${end}". Try e.g. "3:30 pm" or "15:30".`);
     }
+    // An inverted pair isn't a short meeting, it's a mistake — and it used
+    // to be accepted, after which the item was invisible to conflict checks
+    // and free-slot finding, and counted as 0.0h in week_overview. The
+    // format can't express a meeting crossing midnight, so say so.
+    if (startMinutes != null && endMinutes != null && endMinutes <= startMinutes) {
+      return text(
+        `The end time (${end}) isn't after the start time (${start}). ` +
+          `If this runs past midnight, split it across the two days.`
+      );
+    }
 
     const resolvedDate = resolveDateArg(date, todayString());
     if (resolvedDate.error) return text(resolvedDate.error);
@@ -618,11 +636,25 @@ server.registerTool(
     }
 
     const touchesTiming = date !== undefined || start !== undefined || end !== undefined || clear_start || clear_end;
+    const effectiveDate = dateString !== undefined ? dateString : task.dateString;
+    const effectiveStart = startMinutes !== undefined ? startMinutes : task.startMinutes;
+    const explicitEnd = endMinutes !== undefined ? endMinutes : task.endMinutes;
+
+    // Checked whether or not `confirm` is set, and against the values the
+    // file will actually end up with. Moving only `start` past an existing
+    // `end` used to produce an inverted pair on disk — and silently skipped
+    // the conflict check too, because the inverted range overlapped nothing.
+    if (touchesTiming && effectiveStart != null && explicitEnd != null && explicitEnd <= effectiveStart) {
+      return text(
+        `That would leave the end time at or before the start time ` +
+          `(${formatMinutesDisplay(effectiveStart)} → ${formatMinutesDisplay(explicitEnd)}). ` +
+          `Pass both start and end together, or clear_end: true to drop the end time.`
+      );
+    }
+
     if (touchesTiming && !confirm) {
-      const effectiveDate = dateString !== undefined ? dateString : task.dateString;
-      const effectiveStart = startMinutes !== undefined ? startMinutes : task.startMinutes;
       if (effectiveStart != null) {
-        const effectiveEnd = endMinutes !== undefined ? endMinutes : task.endMinutes ?? effectiveStart + 30;
+        const effectiveEnd = explicitEnd ?? effectiveStart + 30;
         const conflicts = findConflicts(tasks, effectiveDate, effectiveStart, effectiveEnd, task.id);
         if (conflicts.length) {
           return text(
@@ -657,7 +689,7 @@ server.registerTool(
     );
 
     try {
-      writeAtomically(task.filePath, contents, task.modifiedAtMs);
+      writeAtomically(task.filePath, contents, task.signature);
     } catch (err) {
       if (err instanceof StaleWriteError) return text(staleWriteMessage(task));
       throw err;
@@ -789,7 +821,7 @@ server.registerTool(
     try {
       // Especially important here: this tool promises to only ever append.
       // Without the check, a concurrent edit would make it silently replace.
-      writeAtomically(task.filePath, contents, task.modifiedAtMs);
+      writeAtomically(task.filePath, contents, task.signature);
     } catch (err) {
       if (err instanceof StaleWriteError) return text(staleWriteMessage(task));
       throw err;
@@ -801,7 +833,14 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`ready — watching ${TASKS_DIR}`);
+  // Stay up even when the folder is missing: a server that exits can't
+  // explain itself, and Claude Desktop just reports a dead connector. Up
+  // and complaining is strictly more useful than gone.
+  if (TASKS_DIR) {
+    log(`ready — watching ${TASKS_DIR} (found via ${resolvedTasksDir.source})`);
+  } else {
+    log(`ready BUT NO TASKS FOLDER — ${resolvedTasksDir.error}`);
+  }
 }
 
 main().catch((err) => {

@@ -48,19 +48,43 @@ function resolveDateRange({ date, end_date, days_ahead }, today) {
   return [start];
 }
 
+// How much room an item actually takes up. These two constants, and the
+// function below, are the SINGLE definition of that — mirrored from
+// Sources/ToDoCore/TimelineLayout.swift.
+//
+// They used to be inlined separately in each function, and had drifted:
+// findConflicts used the item's true length while findOverlappingIds applied
+// a 15-minute floor. So add_task would happily book something at 10:10
+// against a 10:00–10:05 item, and then week_overview — and the app's own row
+// warning — immediately called the same pair overlapping.
+const ASSUMED_DURATION_MINUTES = 30;
+const MINIMUM_FOOTPRINT_MINUTES = 15;
+
+/** The [start, end) an item occupies, or null if it isn't scheduled. */
+function effectiveRange(task) {
+  const start = task.startMinutes;
+  if (start == null) return null;
+  const end = Math.max(
+    task.endMinutes ?? start + ASSUMED_DURATION_MINUTES,
+    start + MINIMUM_FOOTPRINT_MINUTES
+  );
+  return { start, end };
+}
+
 /** Every not-done, timed item on `dateString` other than `excludeId` whose
  * range overlaps [startMinutes, endMinutes). Mirrors the overlap check the
  * app itself uses, so a conflict flagged here matches what the row-level
  * "Overlaps another item" warning would show. */
 function findConflicts(tasks, dateString, startMinutes, endMinutes, excludeId) {
+  const from = startMinutes;
+  const to = Math.max(endMinutes, startMinutes + MINIMUM_FOOTPRINT_MINUTES);
   return tasks.filter((t) => {
     if (t.id === excludeId) return false;
     if (t.done) return false;
     if (t.dateString !== dateString) return false;
-    if (t.startMinutes == null) return false;
-    const tStart = t.startMinutes;
-    const tEnd = t.endMinutes ?? tStart + 30;
-    return startMinutes < tEnd && tStart < endMinutes;
+    const range = effectiveRange(t);
+    if (!range) return false;
+    return from < range.end && range.start < to;
   });
 }
 
@@ -69,12 +93,11 @@ function findConflicts(tasks, dateString, startMinutes, endMinutes, excludeId) {
  * same thing here as it does in the app's UI. */
 function findOverlappingIds(items) {
   const entries = items
-    .filter((t) => t.startMinutes != null)
-    .map((t) => ({
-      id: t.id,
-      start: t.startMinutes,
-      end: Math.max(t.endMinutes ?? t.startMinutes + 30, t.startMinutes + 15),
-    }))
+    .map((t) => {
+      const range = effectiveRange(t);
+      return range ? { id: t.id, ...range } : null;
+    })
+    .filter(Boolean)
     .sort((a, b) => a.start - b.start);
 
   const overlapping = new Set();
@@ -99,10 +122,12 @@ function findFreeSlots(tasks, { dates, durationMinutes, bufferMinutes, workStart
     if (dayStart >= workEndMinutes) continue;
 
     const busy = tasks
-      .filter((t) => !t.done && t.dateString === dateString && t.startMinutes != null)
-      .map((t) => ({
-        start: Math.max(dayStart, t.startMinutes - bufferMinutes),
-        end: Math.min(workEndMinutes, (t.endMinutes ?? t.startMinutes + 30) + bufferMinutes),
+      .filter((t) => !t.done && t.dateString === dateString)
+      .map(effectiveRange)
+      .filter(Boolean)
+      .map((range) => ({
+        start: Math.max(dayStart, range.start - bufferMinutes),
+        end: Math.min(workEndMinutes, range.end + bufferMinutes),
       }))
       // Clamping an item that lies wholly OUTSIDE the working window inverts
       // it (an 8pm meeting against a 7pm work_end becomes start 8pm/end 7pm).
@@ -144,6 +169,9 @@ function formatSlot(slot) {
 }
 
 module.exports = {
+  ASSUMED_DURATION_MINUTES,
+  MINIMUM_FOOTPRINT_MINUTES,
+  effectiveRange,
   addDays,
   dayOfWeekLabel,
   datesInRange,

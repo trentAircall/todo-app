@@ -24,8 +24,10 @@ const {
   setValue,
   appendEnrichmentEntry,
   writeAtomically,
+  fileSignature,
   StaleWriteError,
   newFilename,
+  sanitizeValue,
 } = require('../taskfile');
 const { findFreeSlots, findOverlappingIds, findConflicts } = require('../planning');
 
@@ -248,27 +250,54 @@ test('a stale write is refused instead of clobbering the other writer', async ()
   const file = path.join(dir, 'task.md');
   try {
     fs.writeFileSync(file, 'original\n', 'utf8');
-    const snapshotMtime = fs.statSync(file).mtimeMs;
+    const snapshot = fileSignature(file);
 
     // Someone else edits the file after we read it.
     await new Promise((r) => setTimeout(r, 20));
     fs.writeFileSync(file, 'their change\n', 'utf8');
 
     assert.throws(
-      () => writeAtomically(file, 'our change\n', snapshotMtime),
+      () => writeAtomically(file, 'our change\n', snapshot),
       StaleWriteError,
       'writing against a stale snapshot must throw'
     );
     assert.strictEqual(fs.readFileSync(file, 'utf8'), 'their change\n', 'their change survives');
 
-    // Writing against the current mtime succeeds.
-    writeAtomically(file, 'our change\n', fs.statSync(file).mtimeMs);
+    // Writing against the current signature succeeds.
+    writeAtomically(file, 'our change\n', fileSignature(file));
     assert.strictEqual(fs.readFileSync(file, 'utf8'), 'our change\n');
 
-    // And a create (no expected mtime) is always allowed.
+    // And a create (no expected signature) is always allowed.
     const fresh = path.join(dir, 'new.md');
     writeAtomically(fresh, 'hello\n');
     assert.strictEqual(fs.readFileSync(fresh, 'utf8'), 'hello\n');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a concurrent write is caught even with no delay at all', () => {
+  // The previous 1ms tolerance was WIDER than the entire read-to-write gap
+  // inside a tool call (~0.02-0.55ms), so the check could never fire in the
+  // scenario it was written for. No sleep here on purpose: with strict
+  // comparison this must still be caught.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-stale-'));
+  const file = path.join(dir, 'task.md');
+  try {
+    let caught = 0;
+    const attempts = 50;
+    for (let i = 0; i < attempts; i++) {
+      fs.writeFileSync(file, `original ${i}\n`, 'utf8');
+      const snapshot = fileSignature(file);
+      fs.writeFileSync(file, `theirs ${i}\n`, 'utf8'); // immediately, no await
+      try {
+        writeAtomically(file, `ours ${i}\n`, snapshot);
+      } catch (err) {
+        if (err instanceof StaleWriteError) caught++;
+        else throw err;
+      }
+    }
+    assert.strictEqual(caught, attempts, 'every same-tick concurrent write must be refused');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

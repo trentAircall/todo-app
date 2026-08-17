@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import ToDoCore
 
 /// The day run-sheet: a flat, time-sorted list of scheduled tasks/meetings,
@@ -9,9 +10,16 @@ import ToDoCore
 struct ContentView: View {
     @ObservedObject var store: TaskStore
     @State private var selectedDate = Date()
+    /// The app is built to be left running for days, and `selectedDate` was
+    /// set once at init with nothing to advance it. Leave the window open
+    /// overnight and the header still said "Today · yesterday" — so a
+    /// quick-added task silently landed on the wrong day, straight into the
+    /// Overdue pile. This rolls the view forward at midnight, but only while
+    /// you're actually looking at today.
+    @State private var now = Date()
+    private let clock = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
     @State private var quickAddText = ""
     @State private var editorTarget: EditorTarget?
-    @State private var isSearching = false
     @State private var searchText = ""
     @FocusState private var searchFieldFocused: Bool
 
@@ -29,7 +37,8 @@ struct ContentView: View {
     }
 
     private var selectedDateString: String { TaskFile.dateOnlyFormatter.string(from: selectedDate) }
-    private var isToday: Bool { selectedDateString == TaskFile.todayString() }
+    private var todayString: String { TaskFile.todayString(now) }
+    private var isToday: Bool { selectedDateString == todayString }
 
     private var itemsForDay: [TaskItem] {
         store.tasks.filter { $0.dateString == selectedDateString }
@@ -37,7 +46,11 @@ struct ContentView: View {
     private var scheduled: [TaskItem] {
         itemsForDay.filter(\.hasTime).sorted { ($0.startMinutes ?? 0) < ($1.startMinutes ?? 0) }
     }
-    private var overlappingIDs: Set<URL> { TimelineLayout.overlappingTaskIDs(scheduled) }
+    /// Only live items clash. A meeting you've already ticked off was still
+    /// flagging the one that replaced it as "Overlaps another item".
+    private var overlappingIDs: Set<URL> {
+        TimelineLayout.overlappingTaskIDs(scheduled.filter { !$0.isDone })
+    }
     private var unscheduled: [TaskItem] {
         itemsForDay.filter { !$0.hasTime }.sorted { a, b in
             if a.isDone != b.isDone { return !a.isDone }
@@ -51,7 +64,7 @@ struct ContentView: View {
     private var overdueItems: [TaskItem] {
         guard isToday else { return [] }
         return store.tasks
-            .filter { !$0.isDone && $0.dateString < selectedDateString }
+            .filter { !$0.isDone && $0.dateString < todayString }
             .sorted { a, b in
                 // Oldest first, then by time within a day — sorting on the
                 // date alone left same-day items in whatever order the
@@ -63,6 +76,12 @@ struct ContentView: View {
                 }
                 return a.createdAt < b.createdAt
             }
+    }
+
+    /// Typing is what puts the view into search — there's no mode to enter
+    /// or leave, and clearing the field puts you back on the day you were on.
+    private var isSearchActive: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Cross-day search over every task's title, tags, and description —
@@ -86,15 +105,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             dayHeader
             Divider()
-            if isSearching {
-                searchBar
-            } else {
-                quickAddBar
-            }
+            searchBar
+            Divider()
+            quickAddBar
             Divider()
 
             ScrollView {
-                if isSearching {
+                if isSearchActive {
                     searchResultsList
                 } else {
                     dayContent
@@ -105,8 +122,11 @@ struct ContentView: View {
             footer
         }
         .frame(minWidth: 520, minHeight: 680)
-        // Writes used to fail silently — the sheet would close and the edit
-        // would simply be gone. Anything the store couldn't write now says so.
+        // Only for failures raised OUTSIDE the editor sheet — a failed
+        // checkbox toggle, a failed delete, an unreadable file. A save that
+        // fails inside the sheet is reported by the sheet itself: an alert
+        // attached here would be requested in the same update that tears the
+        // sheet down, and SwiftUI drops it.
         .alert(
             store.lastError?.message ?? "Something went wrong.",
             isPresented: Binding(
@@ -119,6 +139,17 @@ struct ContentView: View {
         } message: { error in
             Text(error.detail)
         }
+        .onReceive(clock) { now = $0 }
+        .onAppear { now = Date() }
+        // ⌘F jumps to the search field. Zero-size and hidden from the layout;
+        // it exists only to own the shortcut.
+        .background(
+            Button("") { searchFieldFocused = true }
+                .keyboardShortcut("f", modifiers: .command)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+        )
         .sheet(item: $editorTarget) { target in
             switch target {
             case .new:
@@ -200,13 +231,7 @@ struct ContentView: View {
 
     private var searchResultsList: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text("Type to search titles, tags, and notes across every day.")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .multilineTextAlignment(.center)
-                    .padding(.top, 40)
-            } else if searchResults.isEmpty {
+            if searchResults.isEmpty {
                 Text("No matches for \u{201C}\(searchText)\u{201D}.")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
@@ -264,42 +289,41 @@ struct ContentView: View {
             Button { changeDay(by: 1) } label: { Image(systemName: "chevron.right") }
                 .buttonStyle(.plain)
 
-            Button {
-                isSearching.toggle()
-                if isSearching {
-                    searchFieldFocused = true
-                } else {
-                    searchText = ""
-                }
-            } label: {
-                Image(systemName: isSearching ? "xmark.circle.fill" : "magnifyingglass")
-            }
-            .buttonStyle(.plain)
-            .help(isSearching ? "Close search" : "Search all days")
-            .padding(.leading, 10)
         }
         .padding()
     }
 
+    /// Always on screen rather than hidden behind a toggle. Looking back at
+    /// what happened is half of what this app is for, and it used to be a
+    /// bare magnifying-glass icon that replaced the quick-add field — so it
+    /// read as a mode you had to know about, and most of the time nobody did.
     private var searchBar: some View {
-        HStack {
+        HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
-            TextField("Search titles, tags, and notes across every day…", text: $searchText)
+            TextField("Search every day — titles, tags, and notes", text: $searchText)
                 .textFieldStyle(.plain)
                 .focused($searchFieldFocused)
-            if !searchText.isEmpty {
+                .onSubmit { searchFieldFocused = true }
+
+            if isSearchActive {
+                Text(searchResults.count == 1 ? "1 match" : "\(searchResults.count) matches")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
                 Button {
                     searchText = ""
+                    searchFieldFocused = false
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .help("Clear search and go back to the day")
             }
         }
         .padding(.horizontal)
-        .padding(.bottom, 10)
+        .padding(.vertical, 8)
     }
 
     private var quickAddBar: some View {
@@ -367,7 +391,6 @@ struct ContentView: View {
             selectedDate = date
         }
         searchText = ""
-        isSearching = false
         editorTarget = .edit(task)
     }
 
