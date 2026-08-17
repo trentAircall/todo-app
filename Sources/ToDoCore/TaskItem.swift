@@ -370,13 +370,6 @@ public enum TaskFile {
 
     // MARK: - Mutation
 
-    /// Finds the line for `key` (case-insensitive) and replaces its value in
-    /// place; appends a new line just before the closing fence if the key
-    /// isn't present; removes the line entirely if `value` is `nil`. Every
-    /// other line — including ones this app doesn't understand — is left
-    /// untouched, in its original position. This is the single mutation
-    /// path used by every save, so the preserve-unknown-data guarantee
-    /// holds everywhere, not just for `done`.
     /// Anything that would end a line, as far as either parser is concerned.
     /// Deliberately NOT all of Unicode's format category — that would catch
     /// zero-width joiners and break emoji, which titles are allowed to have.
@@ -406,6 +399,13 @@ public enum TaskFile {
             .joined(separator: " ")
     }
 
+    /// Finds the line for `key` (case-insensitive) and replaces its value in
+    /// place; appends a new line just before the closing fence if the key
+    /// isn't present; removes the line entirely if `value` is `nil`. Every
+    /// other line — including ones this app doesn't understand — is left
+    /// untouched, in its original position. This is the single mutation
+    /// path used by every save, so the preserve-unknown-data guarantee
+    /// holds everywhere, not just for `done`.
     public static func setValue(_ value: String?, forKey key: String, in lines: [String]) -> [String] {
         let matches = lines.indices.filter { keyOf(lines[$0]) == key }
 
