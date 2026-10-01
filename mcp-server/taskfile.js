@@ -493,8 +493,15 @@ function trashFile(filePath) {
     execFile(
       'osascript',
       [
+        // The `POSIX file` coercion has to happen OUTSIDE the `tell
+        // application "Finder"` block. Inside it, Finder resolves `POSIX
+        // file` against its own dictionary, fails to find such an object and
+        // raises -1728 ("Can't get POSIX file ...") for every path, including
+        // ones that plainly exist. That made delete_task fail 100% of the
+        // time. Coerce to an alias first, then hand Finder a real reference.
         '-e', 'on run argv',
-        '-e', 'tell application "Finder" to delete POSIX file (item 1 of argv)',
+        '-e', 'set f to POSIX file (item 1 of argv) as alias',
+        '-e', 'tell application "Finder" to delete f',
         '-e', 'end run',
         filePath,
       ],
